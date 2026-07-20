@@ -556,7 +556,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
+                "OpenRouter API key not set. Run `zeroclaw onboard` to configure.",
             )
         })?;
 
@@ -636,7 +636,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
+                "OpenRouter API key not set. Run `zeroclaw onboard` to configure.",
             )
         })?;
 
@@ -710,7 +710,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
+                "OpenRouter API key not set. Run `zeroclaw onboard` to configure.",
             )
         })?;
 
@@ -804,7 +804,7 @@ impl ModelProvider for OpenRouterModelProvider {
             None => {
                 return stream::once(async {
                     Err(StreamError::ModelProvider(
-                        "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.".to_string(),
+                        "OpenRouter API key not set. Run `zeroclaw onboard` to configure.".to_string(),
                     ))
                 })
                 .boxed();
@@ -907,7 +907,7 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
+                "OpenRouter API key not set. Run `zeroclaw onboard` to configure.",
             )
         })?;
 

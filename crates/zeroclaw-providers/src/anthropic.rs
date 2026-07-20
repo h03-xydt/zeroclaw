@@ -851,7 +851,7 @@ impl ModelProvider for AnthropicModelProvider {
                 "anthropic: no credentials configured"
             );
             anyhow::Error::msg(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token).",
+                "Anthropic credentials not set. Run `zeroclaw onboard` to configure.",
             )
         })?;
 
@@ -932,7 +932,7 @@ impl ModelProvider for AnthropicModelProvider {
                 "anthropic: no credentials configured"
             );
             anyhow::Error::msg(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token).",
+                "Anthropic credentials not set. Run `zeroclaw onboard` to configure.",
             )
         })?;
 
@@ -1112,7 +1112,8 @@ impl ModelProvider for AnthropicModelProvider {
             None => {
                 return stream::once(async {
                     Err(StreamError::ModelProvider(
-                        "Anthropic credentials not set".to_string(),
+                        "Anthropic credentials not set. Run `zeroclaw onboard` to configure."
+                            .to_string(),
                     ))
                 })
                 .boxed();
