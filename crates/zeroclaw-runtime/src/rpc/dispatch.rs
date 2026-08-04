@@ -2040,12 +2040,37 @@ impl RpcDispatcher {
     async fn handle_session_configure(&self, params: &Value) -> RpcResult {
         let req: SessionConfigureParams = parse_params(params)?;
         validate_session_configure_overrides(&req.overrides)?;
+
+        // Capture the session generation /before/ acquiring the per-session
+        // update lock. If the session is replaced while we wait for the lock,
+        // the re-verification below will detect the mismatch and reject the
+        // stale configure.
+        let session_generation = self
+            .ctx
+            .sessions
+            .get_generation(&req.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        // Acquire the per-session ordering boundary (#9484).
         let _model_provider_update = self
             .ctx
             .sessions
             .lock_model_provider_update(&req.session_id)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        // Re-verify the session has not been replaced while we waited for
+        // the lock. If replaced, this configure is stale — reject it.
+        if self
+            .ctx
+            .sessions
+            .get_generation(&req.session_id)
+            .await
+            != Some(session_generation)
+        {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        }
 
         let merged = self
             .ctx
@@ -2117,6 +2142,7 @@ impl RpcDispatcher {
                 .sessions
                 .apply_model_provider(
                     &req.session_id,
+                    session_generation,
                     model_provider,
                     model_provider_name,
                     model_name,
@@ -2888,15 +2914,32 @@ impl RpcDispatcher {
     {
         let session_ids = ctx.sessions.list_ids().await;
         for session_id in session_ids {
+            // Snapshot identity before acquiring the per-session update lock.
+            // This binds the generation to the session instance that the
+            // refresh will target. If the session is replaced under the same
+            // ID while we wait for the lock or build the provider, the
+            // re-verification after lock acquisition will detect the mismatch.
+            let Some((agent_alias, overrides, session_generation)) =
+                ctx.sessions.refresh_snapshot(&session_id).await
+            else {
+                continue;
+            };
+
+            // Acquire the per-session ordering boundary (#9484). This lock
+            // belongs to the session instance that was live at snapshot time.
             let Some(_model_provider_update) =
                 ctx.sessions.lock_model_provider_update(&session_id).await
             else {
                 continue;
             };
-            let Some(agent_alias) = ctx.sessions.get_agent_alias(&session_id).await else {
+
+            // Re-verify the session has not been replaced while we waited
+            // for the lock. If the generation advanced, a successor was
+            // installed and this refresh is stale — abort.
+            let Some(current_gen) = ctx.sessions.get_generation(&session_id).await else {
                 continue;
             };
-            let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
+            if current_gen != session_generation {
                 continue;
             };
             let (model_provider, model_provider_name, model_name, tool_dispatcher, temperature) = {
@@ -2974,6 +3017,7 @@ impl RpcDispatcher {
                 .sessions
                 .apply_model_provider(
                     &session_id,
+                    session_generation,
                     model_provider,
                     model_provider_name,
                     model_name,

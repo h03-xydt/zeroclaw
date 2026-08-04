@@ -67,6 +67,11 @@ pub struct RpcSession {
     pub plan: Vec<PlanEntry>,
     pub chat_mode: crate::rpc::types::ChatMode,
     pub owner_tui_id: Option<String>,
+    /// Monotonic generation counter stamped by [`SessionStore::insert`].
+    /// Provider-refresh callers capture this before building a provider box
+    /// and pass it to [`SessionStore::apply_model_provider`] so stale work
+    /// cannot mutate a successor installed under the same session ID.
+    pub generation: u64,
 }
 
 impl RpcSession {
@@ -88,6 +93,7 @@ impl RpcSession {
             plan: Vec::new(),
             chat_mode,
             owner_tui_id: None,
+            generation: 0,
         }
     }
 
@@ -107,6 +113,10 @@ pub struct SessionStore {
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
     max_sessions: usize,
     pub session_queue: Arc<SessionActorQueue>,
+    /// Monotonic counter incremented on every [`insert`] that installs or
+    /// replaces a session entry. Captured by provider-refresh callers so
+    /// [`apply_model_provider`] can reject work from a stale instance.
+    session_generation: std::sync::atomic::AtomicU64,
 }
 
 impl SessionStore {
@@ -120,14 +130,20 @@ impl SessionStore {
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
             max_sessions,
             session_queue,
+            session_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    pub async fn insert(&self, id: String, session: RpcSession) -> Result<(), &'static str> {
+    pub async fn insert(&self, id: String, mut session: RpcSession) -> Result<(), &'static str> {
         let mut sessions = self.sessions.lock().await;
         if sessions.len() >= self.max_sessions {
             return Err("session limit reached");
         }
+        let generation = self
+            .session_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+        session.generation = generation;
         sessions.insert(id, session);
         Ok(())
     }
@@ -174,6 +190,15 @@ impl SessionStore {
     #[cfg(test)]
     pub(crate) fn model_provider_update_waiting(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.model_provider_update_waiting)
+    }
+
+    /// Return the current generation for the session with `id`, or `None` if
+    /// the session is absent. Provider-refresh callers capture this value
+    /// before building a provider box and thread it through
+    /// [`apply_model_provider`] so stale work targeting a replaced session
+    /// becomes a no-op.
+    pub async fn get_generation(&self, id: &str) -> Option<u64> {
+        self.sessions.lock().await.get(id).map(|s| s.generation)
     }
 
     pub async fn touch(&self, id: &str) {
@@ -235,9 +260,16 @@ impl SessionStore {
     /// Swap a freshly built `ModelProvider` box (and its name) onto the
     /// session's agent. Called by the dispatcher after it constructs the
     /// box from config, keeping model_provider-build logic out of the store.
+    ///
+    /// `generation` must match the session's current generation (captured
+    /// before the caller built the provider box). If the session was replaced
+    /// under the same ID — e.g. by `session/new` or ACP rehydration — while
+    /// the provider was being built, the generations won't match and this
+    /// call becomes a no-op (returns `false`).
     pub async fn apply_model_provider(
         &self,
         id: &str,
+        generation: u64,
         model_provider: Box<dyn ModelProvider>,
         model_provider_name: String,
         model_name: String,
@@ -246,7 +278,8 @@ impl SessionStore {
         let agent = {
             let sessions = self.sessions.lock().await;
             match sessions.get(id) {
-                Some(s) => s.agent.clone(),
+                Some(s) if s.generation == generation => s.agent.clone(),
+                Some(_) => return false,
                 None => return false,
             }
         };
