@@ -201,6 +201,19 @@ impl SessionStore {
         self.sessions.lock().await.get(id).map(|s| s.generation)
     }
 
+    /// Snapshot the generation, agent alias, and overrides for `id` under
+    /// one lock. Used by provider-refresh callers so a same-ID replacement
+    /// cannot produce a mixed identity snapshot (e.g. old overrides paired
+    /// with the successor's generation).
+    pub async fn refresh_snapshot(
+        &self,
+        id: &str,
+    ) -> Option<(String, SessionOverrides, u64)> {
+        let sessions = self.sessions.lock().await;
+        let s = sessions.get(id)?;
+        Some((s.agent_alias.clone(), s.overrides.clone(), s.generation))
+    }
+
     pub async fn touch(&self, id: &str) {
         if let Some(s) = self.sessions.lock().await.get_mut(id) {
             s.last_active = Instant::now();
@@ -215,6 +228,37 @@ impl SessionStore {
         let merged = self.preview_overrides(id, &patch).await?;
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(id)?;
+        session.overrides = merged.clone();
+        // Apply to agent immediately.
+        let overrides = session.overrides.clone();
+        let agent = session.agent.clone();
+        drop(sessions);
+        let mut guard = agent.lock().await;
+        if let Some(ref m) = overrides.model {
+            guard.set_model_name(m.clone());
+        }
+        if overrides.temperature.is_some() {
+            guard.set_temperature(overrides.temperature);
+        }
+        Some(overrides)
+    }
+
+    /// Like [`set_overrides`], but validates `generation` before mutating the
+    /// session entry or its agent. Returns `None` if the session is absent
+    /// *or* if it was replaced under the same ID — both cases mean the caller
+    /// captured a stale generation and the work must be discarded.
+    pub async fn set_overrides_gated(
+        &self,
+        id: &str,
+        generation: u64,
+        patch: SessionOverrides,
+    ) -> Option<SessionOverrides> {
+        let merged = self.preview_overrides(id, &patch).await?;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions.get_mut(id)?;
+        if session.generation != generation {
+            return None;
+        }
         session.overrides = merged.clone();
         // Apply to agent immediately.
         let overrides = session.overrides.clone();
@@ -266,6 +310,10 @@ impl SessionStore {
     /// under the same ID — e.g. by `session/new` or ACP rehydration — while
     /// the provider was being built, the generations won't match and this
     /// call becomes a no-op (returns `false`).
+    ///
+    /// When `temperature` is `Some`, it is set on the captured agent under
+    /// the same generation check so a replacement cannot sneak a stale
+    /// temperature onto a successor.
     pub async fn apply_model_provider(
         &self,
         id: &str,
@@ -274,6 +322,7 @@ impl SessionStore {
         model_provider_name: String,
         model_name: String,
         tool_dispatcher: Box<dyn ToolDispatcher>,
+        temperature: Option<f64>,
     ) -> bool {
         let agent = {
             let sessions = self.sessions.lock().await;
@@ -288,6 +337,9 @@ impl SessionStore {
         guard.set_model_provider_name(model_provider_name);
         guard.set_model_name(model_name);
         guard.set_tool_dispatcher(tool_dispatcher);
+        if let Some(t) = temperature {
+            guard.set_temperature(t);
+        }
         true
     }
 
@@ -1141,5 +1193,233 @@ mod tests {
             Some(CancelCause::AdminKill),
             "kill_session must preserve AdminKill cause for verdict-site attribution"
         );
+    }
+
+    // ── generation-gated stale-refresh regression tests (#9719) ──
+
+    #[tokio::test]
+    async fn insert_stamps_monotonic_generation() {
+        let store = make_store(4);
+        store
+            .insert(
+                "a".into(),
+                RpcSession::new(make_agent(), "x", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        store
+            .insert(
+                "b".into(),
+                RpcSession::new(make_agent(), "x", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let gen_a = store.get_generation("a").await.unwrap();
+        let gen_b = store.get_generation("b").await.unwrap();
+        assert_ne!(gen_a, gen_b, "each insert must stamp a unique generation");
+
+        // Replace "a" — the successor must get a new generation.
+        store
+            .insert(
+                "a".into(),
+                RpcSession::new(make_agent(), "x", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let gen_a2 = store.get_generation("a").await.unwrap();
+        assert_ne!(
+            gen_a, gen_a2,
+            "replacing a same-ID session must bump the generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_overrides_gated_rejects_stale_generation() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let gen = store.get_generation("s").await.unwrap();
+
+        // Replace the session so generation advances.
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+
+        // Stale generation must be rejected — successor untouched.
+        let result = store
+            .set_overrides_gated(
+                "s",
+                gen,
+                SessionOverrides {
+                    model: Some("intruder".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(result.is_none(), "stale generation must be rejected");
+
+        // Successor's overrides must remain default.
+        let overrides = store.get_overrides("s").await.unwrap();
+        assert_eq!(overrides.model, None, "successor model must be untouched");
+        assert_eq!(
+            overrides.temperature, None,
+            "successor temperature must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_overrides_gated_accepts_current_generation() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let gen = store.get_generation("s").await.unwrap();
+
+        let result = store
+            .set_overrides_gated(
+                "s",
+                gen,
+                SessionOverrides {
+                    model: Some("valid".into()),
+                    temperature: Some(0.7),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(result.is_some(), "current generation must be accepted");
+        let overrides = result.unwrap();
+        assert_eq!(overrides.model.as_deref(), Some("valid"));
+        assert_eq!(overrides.temperature, Some(0.7));
+    }
+
+    #[tokio::test]
+    async fn apply_model_provider_rejects_stale_generation() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let gen = store.get_generation("s").await.unwrap();
+
+        // Replace the session so generation advances.
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+
+        let applied = store
+            .apply_model_provider(
+                "s",
+                gen,
+                Box::new(StubProvider),
+                "stale-provider".into(),
+                "stale-model".into(),
+                Box::new(NativeToolDispatcher),
+                Some(0.99),
+            )
+            .await;
+        assert!(
+            !applied,
+            "stale generation must be rejected by apply_model_provider"
+        );
+
+        // Successor must use the stub, not the stale provider.
+        let agent = store.get_agent("s").await.unwrap();
+        let (_, provider_name, model_name) = agent.lock().await.attribution_fields();
+        assert_eq!(provider_name, "stub", "successor provider name untouched");
+        assert_eq!(model_name, "model-x", "successor model untouched");
+        assert_eq!(
+            agent.lock().await.temperature_for_test(),
+            None,
+            "successor temperature must not be overwritten by stale refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_model_provider_applies_temperature_to_captured_agent() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let gen = store.get_generation("s").await.unwrap();
+
+        let applied = store
+            .apply_model_provider(
+                "s",
+                gen,
+                Box::new(StubProvider),
+                "new-provider".into(),
+                "new-model".into(),
+                Box::new(NativeToolDispatcher),
+                Some(0.42),
+            )
+            .await;
+        assert!(applied, "current generation must be accepted");
+
+        let agent = store.get_agent("s").await.unwrap();
+        let guard = agent.lock().await;
+        let (_, provider_name, model_name) = guard.attribution_fields();
+        assert_eq!(provider_name, "new-provider");
+        assert_eq!(model_name, "new-model");
+        assert_eq!(
+            guard.temperature_for_test(),
+            Some(0.42),
+            "temperature must be set on the captured agent under the generation check"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_snapshot_returns_consistent_identity_under_one_lock() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "alias-x", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let (alias, overrides, gen) =
+            store.refresh_snapshot("s").await.expect("session exists");
+        assert_eq!(alias, "alias-x");
+        assert_eq!(overrides.model, None);
+        assert!(gen > 0);
+
+        // Replace under same ID.
+        let mut repl = RpcSession::new(make_agent(), "alias-y", ".", crate::rpc::types::ChatMode::Chat);
+        repl.overrides.model = Some("successor-override".into());
+        store.insert("s".into(), repl).await.unwrap();
+
+        let (alias2, overrides2, gen2) =
+            store.refresh_snapshot("s").await.expect("session exists");
+        assert_eq!(alias2, "alias-y", "successor alias");
+        assert_eq!(
+            overrides2.model.as_deref(),
+            Some("successor-override"),
+            "successor override"
+        );
+        assert_ne!(gen, gen2, "generation must advance on replacement");
     }
 }

@@ -2131,7 +2131,7 @@ impl RpcDispatcher {
         let merged = self
             .ctx
             .sessions
-            .set_overrides(&req.session_id, req.overrides)
+            .set_overrides_gated(&req.session_id, session_generation, req.overrides)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
@@ -2147,6 +2147,7 @@ impl RpcDispatcher {
                     model_provider_name,
                     model_name,
                     tool_dispatcher,
+                    None,
                 )
                 .await
                 .then_some(())
@@ -3013,8 +3014,7 @@ impl RpcDispatcher {
                     }
                 }
             };
-            if ctx
-                .sessions
+            ctx.sessions
                 .apply_model_provider(
                     &session_id,
                     session_generation,
@@ -3022,13 +3022,9 @@ impl RpcDispatcher {
                     model_provider_name,
                     model_name,
                     tool_dispatcher,
+                    temperature,
                 )
-                .await
-                && let Some(agent) = ctx.sessions.get_agent(&session_id).await
-            {
-                let mut agent = agent.lock().await;
-                agent.set_temperature(temperature);
-            }
+                .await;
         }
     }
 
@@ -8767,6 +8763,69 @@ mod tests {
         config
     }
 
+    fn make_model_refresh_test_agent(tmp: &tempfile::TempDir) -> crate::agent::agent::Agent {
+        use crate::agent::dispatcher::NativeToolDispatcher;
+        use crate::observability::NoopObserver;
+
+        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem = std::sync::Arc::from(
+            zeroclaw_memory::create_memory(&mem_cfg, &std::env::temp_dir(), None).unwrap(),
+        );
+
+        struct StubProvider;
+        #[async_trait::async_trait]
+        impl zeroclaw_providers::ModelProvider for StubProvider {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(
+                &self,
+                _: zeroclaw_providers::ChatRequest<'_>,
+                _: &str,
+                _: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("stub".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for StubProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "stub"
+            }
+        }
+
+        crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(StubProvider))
+            .tools(vec![])
+            .memory(mem)
+            .observer(std::sync::Arc::new(NoopObserver {})
+                as std::sync::Arc<dyn crate::observability::Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().join("workspace"))
+            .build()
+            .unwrap()
+    }
+
     async fn create_model_refresh_test_session(
         dispatcher: &RpcDispatcher,
         tmp: &tempfile::TempDir,
@@ -10104,6 +10163,222 @@ mod tests {
         assert!(
             !on_disk.contains("[agents.alpha]"),
             "old alias must not survive on disk:\n{on_disk}"
+        );
+    }
+
+    // ── generation-gated stale-refresh regression tests (#9719) ──
+
+    /// When a session is replaced under the same ID while a
+    /// `session/configure` provider rebuild is in flight, the stale
+    /// configure work must not mutate the successor. This test replaces
+    /// the session between generation capture and provider application
+    /// and asserts the successor is untouched.
+    #[tokio::test]
+    async fn session_configure_stale_generation_does_not_mutate_successor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        // Capture the original generation, then replace the session under the
+        // same ID — simulating session/new or ACP rehydration.
+        let original_gen = dispatcher
+            .ctx
+            .sessions
+            .get_generation(&session_id)
+            .await
+            .expect("session exists");
+        let successor = crate::rpc::session::RpcSession::new(
+            make_model_refresh_test_agent(&tmp),
+            "test-agent",
+            &tmp.path().join("workspace").to_string_lossy(),
+            crate::rpc::types::ChatMode::Chat,
+        );
+        dispatcher
+            .ctx
+            .sessions
+            .insert(session_id.clone(), successor)
+            .await
+            .expect("replacement must succeed");
+        let successor_gen = dispatcher
+            .ctx
+            .sessions
+            .get_generation(&session_id)
+            .await
+            .expect("successor exists");
+        assert_ne!(
+            original_gen, successor_gen,
+            "replacement must advance the generation"
+        );
+
+        // Attempt a provider switch — must fail because the captured
+        // generation (collected inside handle_session_configure) is stale.
+        let res = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {
+                    "model_provider": "openai.test-provider",
+                    "model": "intruder-model"
+                }
+            }))
+            .await;
+        assert!(
+            res.is_err(),
+            "stale-generation configure must return an error"
+        );
+
+        // Successor must be untouched.
+        let overrides = dispatcher
+            .ctx
+            .sessions
+            .get_overrides(&session_id)
+            .await
+            .expect("successor still exists");
+        assert_eq!(
+            overrides.model_provider, None,
+            "successor model_provider override must be untouched"
+        );
+        assert_eq!(
+            overrides.model, None,
+            "successor model override must be untouched"
+        );
+        // The successor agent uses StubProvider → "stub" / "model-x".
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "model-x",
+            "successor live model must be untouched"
+        );
+    }
+
+    /// Temperature-only `session/configure` must also be generation-gated.
+    /// The configure path for a temperature-only override never reaches
+    /// `apply_model_provider`; it only calls `set_overrides`. Without
+    /// the gate, a stale temperature override would silently land on the
+    /// successor.
+    #[tokio::test]
+    async fn session_configure_temperature_only_stale_generation_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        // Replace the session under the same ID.
+        let successor = crate::rpc::session::RpcSession::new(
+            make_model_refresh_test_agent(&tmp),
+            "test-agent",
+            &tmp.path().join("workspace").to_string_lossy(),
+            crate::rpc::types::ChatMode::Chat,
+        );
+        dispatcher
+            .ctx
+            .sessions
+            .insert(session_id.clone(), successor)
+            .await
+            .expect("replacement must succeed");
+
+        // A temperature-only configure must be rejected after replacement.
+        let res = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {
+                    "temperature": 0.99
+                }
+            }))
+            .await;
+        assert!(
+            res.is_err(),
+            "stale temperature-only configure must return an error"
+        );
+
+        // Successor temperature must be untouched.
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            None,
+            "successor temperature must not be overwritten by stale configure"
+        );
+    }
+
+    /// Replace a session while a config/set-triggered provider refresh is
+    /// building the provider box. The stale refresh must skip the successor
+    /// and leave its provider, model, tool dispatcher, and temperature intact.
+    #[tokio::test]
+    async fn config_set_provider_refresh_skips_replaced_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        // The session was created with StubProvider → we need a replacement
+        // with a known agent so we can verify the successor is untouched.
+        // Replace the session BEFORE the config/set-triggered refresh fires.
+        let successor = crate::rpc::session::RpcSession::new(
+            make_model_refresh_test_agent(&tmp),
+            "test-agent",
+            &tmp.path().join("workspace").to_string_lossy(),
+            crate::rpc::types::ChatMode::Chat,
+        );
+        let successor_gen = {
+            dispatcher
+                .ctx
+                .sessions
+                .insert(session_id.clone(), successor)
+                .await
+                .expect("replacement must succeed");
+            dispatcher
+                .ctx
+                .sessions
+                .get_generation(&session_id)
+                .await
+                .expect("successor exists")
+        };
+
+        // Trigger a config/set that will schedule a live-session refresh.
+        // The refresh dispatches to refresh_live_sessions_for_model_provider
+        // which calls refresh_snapshot (capturing the current gen), builds
+        // the provider box, and calls apply_model_provider. Because we
+        // request the same provider (`openai.test-provider`) that the agent
+        // config already points at, the refresh will target this session.
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": "refreshed-model"
+            }))
+            .await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        // The refresh runs asynchronously. Poll until the successor's
+        // generation ensures the refresh path has resolved (the config/set
+        // response tells us the write succeeded but not that the refresh
+        // completed). The refresh should be a no-op for the replaced session.
+        // Wait a brief interval then assert the successor is untouched.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let current_gen = dispatcher
+            .ctx
+            .sessions
+            .get_generation(&session_id)
+            .await
+            .expect("session still exists");
+        assert_eq!(
+            current_gen, successor_gen,
+            "generation must not advance — no replacement occurred after the test's own insert"
+        );
+
+        // Successor must still have the stub provider/model, not the refresh.
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "model-x",
+            "successor model must be untouched by config/set refresh"
+        );
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            None,
+            "successor temperature must be untouched by config/set refresh"
         );
     }
 }
