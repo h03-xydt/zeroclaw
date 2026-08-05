@@ -3022,7 +3022,7 @@ impl RpcDispatcher {
                     model_provider_name,
                     model_name,
                     tool_dispatcher,
-                    temperature,
+                    Some(temperature),
                 )
                 .await;
         }
@@ -10166,7 +10166,7 @@ mod tests {
         );
     }
 
-    // ── generation-gated stale-refresh regression tests (#9719) ──
+    // ── generation-gated stale-refresh regression tests ──
     //
     // Precise race-condition tests (generation captured then replacement before
     // mutation) live in session::tests because they require store-level control

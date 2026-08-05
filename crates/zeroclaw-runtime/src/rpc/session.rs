@@ -308,9 +308,11 @@ impl SessionStore {
     /// the provider was being built, the generations won't match and this
     /// call becomes a no-op (returns `false`).
     ///
-    /// When `temperature` is `Some`, it is set on the captured agent under
-    /// the same generation check so a replacement cannot sneak a stale
-    /// temperature onto a successor.
+    /// When `temperature` is `Some(v)`, the captured agent's temperature is
+    /// set to `v` (which may be `None`, clearing a prior profile temperature).
+    /// When `temperature` is `None`, the agent's temperature is left unchanged
+    /// — used by `session/configure` where temperature is already committed
+    /// via [`set_overrides_gated`].
     pub async fn apply_model_provider(
         &self,
         id: &str,
@@ -319,7 +321,7 @@ impl SessionStore {
         model_provider_name: String,
         model_name: String,
         tool_dispatcher: Box<dyn ToolDispatcher>,
-        temperature: Option<f64>,
+        temperature: Option<Option<f64>>,
     ) -> bool {
         let agent = {
             let sessions = self.sessions.lock().await;
@@ -335,7 +337,7 @@ impl SessionStore {
         guard.set_model_name(model_name);
         guard.set_tool_dispatcher(tool_dispatcher);
         if let Some(t) = temperature {
-            guard.set_temperature(Some(t));
+            guard.set_temperature(t);
         }
         true
     }
@@ -1192,7 +1194,7 @@ mod tests {
         );
     }
 
-    // ── generation-gated stale-refresh regression tests (#9719) ──
+    // ── generation-gated stale-refresh regression tests ──
 
     use crate::agent::dispatcher::NativeToolDispatcher;
 
@@ -1333,7 +1335,7 @@ mod tests {
                 "stale-provider".into(),
                 "stale-model".into(),
                 Box::new(NativeToolDispatcher),
-                Some(0.99),
+                Some(Some(0.99)),
             )
             .await;
         assert!(
@@ -1377,7 +1379,7 @@ mod tests {
                 "new-provider".into(),
                 "new-model".into(),
                 Box::new(NativeToolDispatcher),
-                Some(0.42),
+                Some(Some(0.42)),
             )
             .await;
         assert!(applied, "current generation must be accepted");
