@@ -205,10 +205,7 @@ impl SessionStore {
     /// one lock. Used by provider-refresh callers so a same-ID replacement
     /// cannot produce a mixed identity snapshot (e.g. old overrides paired
     /// with the successor's generation).
-    pub async fn refresh_snapshot(
-        &self,
-        id: &str,
-    ) -> Option<(String, SessionOverrides, u64)> {
+    pub async fn refresh_snapshot(&self, id: &str) -> Option<(String, SessionOverrides, u64)> {
         let sessions = self.sessions.lock().await;
         let s = sessions.get(id)?;
         Some((s.agent_alias.clone(), s.overrides.clone(), s.generation))
@@ -1214,9 +1211,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let gen_a = store.get_generation("a").await.unwrap();
-        let gen_b = store.get_generation("b").await.unwrap();
-        assert_ne!(gen_a, gen_b, "each insert must stamp a unique generation");
+        let g_a = store.get_generation("a").await.unwrap();
+        let g_b = store.get_generation("b").await.unwrap();
+        assert_ne!(g_a, g_b, "each insert must stamp a unique generation");
 
         // Replace "a" — the successor must get a new generation.
         store
@@ -1226,9 +1223,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let gen_a2 = store.get_generation("a").await.unwrap();
+        let g_a2 = store.get_generation("a").await.unwrap();
         assert_ne!(
-            gen_a, gen_a2,
+            g_a, g_a2,
             "replacing a same-ID session must bump the generation"
         );
     }
@@ -1243,7 +1240,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let gen = store.get_generation("s").await.unwrap();
+        let captured_gen = store.get_generation("s").await.unwrap();
 
         // Replace the session so generation advances.
         store
@@ -1258,7 +1255,7 @@ mod tests {
         let result = store
             .set_overrides_gated(
                 "s",
-                gen,
+                captured_gen,
                 SessionOverrides {
                     model: Some("intruder".into()),
                     ..Default::default()
@@ -1286,12 +1283,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let gen = store.get_generation("s").await.unwrap();
+        let captured_gen = store.get_generation("s").await.unwrap();
 
         let result = store
             .set_overrides_gated(
                 "s",
-                gen,
+                captured_gen,
                 SessionOverrides {
                     model: Some("valid".into()),
                     temperature: Some(0.7),
@@ -1315,7 +1312,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let gen = store.get_generation("s").await.unwrap();
+        let captured_gen = store.get_generation("s").await.unwrap();
 
         // Replace the session so generation advances.
         store
@@ -1329,7 +1326,7 @@ mod tests {
         let applied = store
             .apply_model_provider(
                 "s",
-                gen,
+                captured_gen,
                 Box::new(StubProvider),
                 "stale-provider".into(),
                 "stale-model".into(),
@@ -1364,12 +1361,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let gen = store.get_generation("s").await.unwrap();
+        let captured_gen = store.get_generation("s").await.unwrap();
 
         let applied = store
             .apply_model_provider(
                 "s",
-                gen,
+                captured_gen,
                 Box::new(StubProvider),
                 "new-provider".into(),
                 "new-model".into(),
@@ -1397,22 +1394,32 @@ mod tests {
         store
             .insert(
                 "s".into(),
-                RpcSession::new(make_agent(), "alias-x", ".", crate::rpc::types::ChatMode::Chat),
+                RpcSession::new(
+                    make_agent(),
+                    "alias-x",
+                    ".",
+                    crate::rpc::types::ChatMode::Chat,
+                ),
             )
             .await
             .unwrap();
-        let (alias, overrides, gen) =
+        let (alias, overrides, captured_gen) =
             store.refresh_snapshot("s").await.expect("session exists");
         assert_eq!(alias, "alias-x");
         assert_eq!(overrides.model, None);
-        assert!(gen > 0);
+        assert!(captured_gen > 0);
 
         // Replace under same ID.
-        let mut repl = RpcSession::new(make_agent(), "alias-y", ".", crate::rpc::types::ChatMode::Chat);
+        let mut repl = RpcSession::new(
+            make_agent(),
+            "alias-y",
+            ".",
+            crate::rpc::types::ChatMode::Chat,
+        );
         repl.overrides.model = Some("successor-override".into());
         store.insert("s".into(), repl).await.unwrap();
 
-        let (alias2, overrides2, gen2) =
+        let (alias2, overrides2, captured_gen2) =
             store.refresh_snapshot("s").await.expect("session exists");
         assert_eq!(alias2, "alias-y", "successor alias");
         assert_eq!(
@@ -1420,6 +1427,9 @@ mod tests {
             Some("successor-override"),
             "successor override"
         );
-        assert_ne!(gen, gen2, "generation must advance on replacement");
+        assert_ne!(
+            captured_gen, captured_gen2,
+            "generation must advance on replacement"
+        );
     }
 }
