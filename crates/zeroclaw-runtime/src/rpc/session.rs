@@ -335,7 +335,7 @@ impl SessionStore {
         guard.set_model_name(model_name);
         guard.set_tool_dispatcher(tool_dispatcher);
         if let Some(t) = temperature {
-            guard.set_temperature(t);
+            guard.set_temperature(Some(t));
         }
         true
     }
@@ -1194,6 +1194,8 @@ mod tests {
 
     // ── generation-gated stale-refresh regression tests (#9719) ──
 
+    use crate::agent::dispatcher::NativeToolDispatcher;
+
     #[tokio::test]
     async fn insert_stamps_monotonic_generation() {
         let store = make_store(4);
@@ -1339,11 +1341,15 @@ mod tests {
             "stale generation must be rejected by apply_model_provider"
         );
 
-        // Successor must use the stub, not the stale provider.
+        // Successor must retain the default agent identity — the stale
+        // provider refresh must not have touched it.
         let agent = store.get_agent("s").await.unwrap();
         let (_, provider_name, model_name) = agent.lock().await.attribution_fields();
-        assert_eq!(provider_name, "stub", "successor provider name untouched");
-        assert_eq!(model_name, "model-x", "successor model untouched");
+        assert_eq!(
+            provider_name, "<unconfigured>",
+            "successor provider name untouched"
+        );
+        assert_eq!(model_name, "<unconfigured>", "successor model untouched");
         assert_eq!(
             agent.lock().await.temperature_for_test(),
             None,
