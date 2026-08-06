@@ -10166,19 +10166,21 @@ mod tests {
         );
     }
 
-    // ── generation-gated stale-refresh regression tests ──
+    // ── generation-gated stale-refresh in-flight race tests ──
     //
-    // Precise race-condition tests (generation captured then replacement before
-    // mutation) live in session::tests because they require store-level control
-    // of the generation-capture / apply boundary. The dispatch-level tests below
-    // verify end-to-end correctness: the gated methods are wired into the RPC
-    // handler paths, and the async config/set refresh pipeline correctly
-    // snapshots generation before building the provider box.
+    // These tests use a SessionStore test-only gate to pause stale work
+    // after the generation is captured but before the gated method commits,
+    // then replace the session under the same ID before releasing the gate.
+    // This exercises the failure mode in #9719: an in-flight configure or
+    // config/set refresh that captured the old session identity must not
+    // mutate a successor installed while the work was pending.
 
-    /// Replacement before `session/configure` must succeed: the handler
-    /// captures the successor's generation at entry and commits to it.
+    /// Deterministic race: `session/configure` captures the original
+    /// generation, then the session is replaced while the stale configure
+    /// is paused at `set_overrides_gated`. The stale work must be rejected
+    /// and the successor must remain untouched.
     #[tokio::test]
-    async fn session_configure_succeeds_on_replaced_session() {
+    async fn session_configure_stale_gen_replaced_during_provider_build() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
@@ -10187,95 +10189,65 @@ mod tests {
             "old-model"
         );
 
-        // Replace the session under the same ID before calling configure.
+        let sessions = Arc::clone(&dispatcher.ctx.sessions);
+        let (entered, release) = sessions.set_test_gated_op_pause();
+        let sid = session_id.clone();
+
+        // Spawn the handler — it will capture the generation, build the
+        // provider, then block at the gate inside set_overrides_gated.
+        let handle = tokio::spawn(async move {
+            dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": sid,
+                    "overrides": {
+                        "model_provider": "openai.test-provider",
+                        "model": "intruder-model"
+                    }
+                }))
+                .await
+        });
+
+        // Wait for the handler to enter the gate.
+        entered.notified().await;
+
+        // Replace the session while the stale configure is paused.
         let successor = crate::rpc::session::RpcSession::new(
             make_model_refresh_test_agent(&tmp),
             "test-agent",
             &tmp.path().join("workspace").to_string_lossy(),
             crate::rpc::types::ChatMode::Chat,
         );
-        dispatcher
-            .ctx
-            .sessions
+        sessions
             .insert(session_id.clone(), successor)
             .await
-            .expect("replacement must succeed");
+            .expect("replacement must succeed while configure is paused");
 
-        // Configure must succeed — the handler snapshots the current
-        // (successor) generation and the gate matches.
-        let res = dispatcher
-            .handle_session_configure(&json!({
-                "session_id": session_id,
-                "overrides": {
-                    "model_provider": "openai.test-provider",
-                    "model": "configured-model"
-                }
-            }))
-            .await;
+        // Release the gate — stale work sees the generation mismatch.
+        release.notify_one();
+
+        let res = handle.await.expect("spawned configure must not panic");
         assert!(
-            res.is_ok(),
-            "configure on replacement session must succeed: {res:?}"
+            res.is_err(),
+            "stale-generation configure after replacement must fail; got: {res:?}"
         );
 
-        let overrides = dispatcher
-            .ctx
-            .sessions
+        sessions.clear_test_gated_op_pause();
+
+        // Successor must be untouched.
+        let overrides = sessions
             .get_overrides(&session_id)
             .await
-            .expect("session still exists");
-        assert_eq!(
-            overrides.model.as_deref(),
-            Some("configured-model"),
-            "override must be committed on the successor"
-        );
+            .expect("successor still exists");
+        assert_eq!(overrides.model_provider, None);
+        assert_eq!(overrides.model, None);
     }
 
-    /// Temperature-only `session/configure` must succeed on a replaced session.
+    /// Deterministic race: config/set triggers an async refresh. The
+    /// refresh snapshots the session identity, then the session is
+    /// replaced while the refresh is paused at `apply_model_provider`.
+    /// The stale refresh must skip the successor.
     #[tokio::test]
-    async fn session_configure_temperature_only_succeeds_on_replaced_session() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
-        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
-
-        // Replace the session under the same ID.
-        let successor = crate::rpc::session::RpcSession::new(
-            make_model_refresh_test_agent(&tmp),
-            "test-agent",
-            &tmp.path().join("workspace").to_string_lossy(),
-            crate::rpc::types::ChatMode::Chat,
-        );
-        dispatcher
-            .ctx
-            .sessions
-            .insert(session_id.clone(), successor)
-            .await
-            .expect("replacement must succeed");
-
-        let res = dispatcher
-            .handle_session_configure(&json!({
-                "session_id": session_id,
-                "overrides": {
-                    "temperature": 0.7
-                }
-            }))
-            .await;
-        assert!(
-            res.is_ok(),
-            "temperature-only configure on replacement session must succeed: {res:?}"
-        );
-
-        assert_eq!(
-            temperature_for_session(&dispatcher, &session_id).await,
-            Some(0.7),
-            "temperature override must be committed on the successor"
-        );
-    }
-
-    /// Config/set-triggered refresh must update a session that was replaced
-    /// before the config change: the refresh snapshots the successor's
-    /// generation and applies the new provider to it.
-    #[tokio::test]
-    async fn config_set_refresh_updates_pre_replaced_session() {
+    async fn config_set_refresh_stale_gen_replaced_during_provider_build() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
@@ -10284,21 +10256,12 @@ mod tests {
             "old-model"
         );
 
-        // Replace the session BEFORE the config/set-triggered refresh fires.
-        let successor = crate::rpc::session::RpcSession::new(
-            make_model_refresh_test_agent(&tmp),
-            "test-agent",
-            &tmp.path().join("workspace").to_string_lossy(),
-            crate::rpc::types::ChatMode::Chat,
-        );
-        dispatcher
-            .ctx
-            .sessions
-            .insert(session_id.clone(), successor)
-            .await
-            .expect("replacement must succeed");
+        let sessions = Arc::clone(&dispatcher.ctx.sessions);
+        let (entered, release) = sessions.set_test_gated_op_pause();
 
-        // Trigger a config/set that schedules a live-session refresh.
+        // Trigger config/set — schedules an async refresh that will
+        // snapshot the session, build the provider, then block at
+        // apply_model_provider.
         let res = dispatcher
             .handle_config_set(&json!({
                 "prop": "providers.models.openai.test-provider.model",
@@ -10307,13 +10270,37 @@ mod tests {
             .await;
         assert!(res.is_ok(), "config/set must succeed: {res:?}");
 
-        // The async refresh snapshots the successor's generation and applies
-        // the new provider. Wait for the refresh to land.
-        wait_for_model_name(&dispatcher, &session_id, "refreshed-model").await;
+        // Wait for the async refresh to reach the gate.
+        entered.notified().await;
+
+        // Replace the session while the stale refresh is paused.
+        let successor = crate::rpc::session::RpcSession::new(
+            make_model_refresh_test_agent(&tmp),
+            "test-agent",
+            &tmp.path().join("workspace").to_string_lossy(),
+            crate::rpc::types::ChatMode::Chat,
+        );
+        sessions
+            .insert(session_id.clone(), successor)
+            .await
+            .expect("replacement must succeed while refresh is paused");
+
+        // Release the gate — stale refresh sees mismatch and skips.
+        release.notify_one();
+
+        sessions.clear_test_gated_op_pause();
+
+        // The stale refresh is a no-op. Brief sleep then assert.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert_eq!(
             model_name_for_session(&dispatcher, &session_id).await,
-            "refreshed-model",
-            "successor must receive the config/set refresh since replacement pre-dates the config change"
+            "<unconfigured>",
+            "successor model must be untouched by stale config/set refresh"
+        );
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            None,
+            "successor temperature must be untouched"
         );
     }
 }

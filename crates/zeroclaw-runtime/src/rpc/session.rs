@@ -117,6 +117,13 @@ pub struct SessionStore {
     /// replaces a session entry. Captured by provider-refresh callers so
     /// [`apply_model_provider`] can reject work from a stale instance.
     session_generation: std::sync::atomic::AtomicU64,
+    /// Test-only gate: when set, [`set_overrides_gated`] and
+    /// [`apply_model_provider`] signal `entered` on entry then wait on
+    /// `release`, letting a regression test atomically replace the session
+    /// while stale work is paused at the pre-commit boundary.
+    #[cfg(test)]
+    test_gated_op_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 impl SessionStore {
@@ -131,6 +138,8 @@ impl SessionStore {
             max_sessions,
             session_queue,
             session_generation: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            test_gated_op_pause: std::sync::Mutex::new(None),
         }
     }
 
@@ -201,6 +210,46 @@ impl SessionStore {
         self.sessions.lock().await.get(id).map(|s| s.generation)
     }
 
+    /// Await the test-only pause gate before validating generation in
+    /// [`set_overrides_gated`] and [`apply_model_provider`].
+    #[cfg(test)]
+    async fn wait_test_gate(&self) {
+        let (entered, release) = {
+            let guard = self.test_gated_op_pause.lock().unwrap();
+            match &*guard {
+                Some((e, r)) => (e.clone(), r.clone()),
+                None => return,
+            }
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    async fn wait_test_gate(&self) {}
+
+    /// Install a test-only pause gate at the pre-commit boundary inside
+    /// [`set_overrides_gated`] and [`apply_model_provider`]. Returns
+    /// `(entered, release)`:
+    /// - `entered`: wait on this to know the stale work has reached the
+    ///   gate (generation already captured, commit pending).
+    /// - `release`: signal this after replacing the session to let the
+    ///   stale work see the generation mismatch and bail out.
+    #[cfg(test)]
+    pub fn set_test_gated_op_pause(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_gated_op_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
+    #[cfg(test)]
+    pub fn clear_test_gated_op_pause(&self) {
+        *self.test_gated_op_pause.lock().unwrap() = None;
+    }
+
     /// Snapshot the generation, agent alias, and overrides for `id` under
     /// one lock. Used by provider-refresh callers so a same-ID replacement
     /// cannot produce a mixed identity snapshot (e.g. old overrides paired
@@ -250,6 +299,7 @@ impl SessionStore {
         generation: u64,
         patch: SessionOverrides,
     ) -> Option<SessionOverrides> {
+        self.wait_test_gate().await;
         let merged = self.preview_overrides(id, &patch).await?;
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(id)?;
@@ -323,6 +373,7 @@ impl SessionStore {
         tool_dispatcher: Box<dyn ToolDispatcher>,
         temperature: Option<Option<f64>>,
     ) -> bool {
+        self.wait_test_gate().await;
         let agent = {
             let sessions = self.sessions.lock().await;
             match sessions.get(id) {
