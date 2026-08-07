@@ -118,12 +118,17 @@ pub struct SessionStore {
     /// [`apply_model_provider`] can reject work from a stale instance.
     session_generation: std::sync::atomic::AtomicU64,
     /// Test-only gate: when set, [`set_overrides_gated`] and
-    /// [`apply_model_provider`] signal `entered` on entry then wait on
-    /// `release`, letting a regression test atomically replace the session
-    /// while stale work is paused at the pre-commit boundary.
+    /// [`apply_model_provider`] signal `entered` on entry, wait on
+    /// `release`, then signal `done` on exit, letting a regression test
+    /// atomically replace the session and wait for completion.
     #[cfg(test)]
-    test_gated_op_pause:
-        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    test_gated_op_pause: std::sync::Mutex<
+        Option<(
+            Arc<tokio::sync::Notify>, // entered
+            Arc<tokio::sync::Notify>, // release
+            Arc<tokio::sync::Notify>, // done
+        )>,
+    >,
 }
 
 impl SessionStore {
@@ -214,15 +219,16 @@ impl SessionStore {
     /// [`set_overrides_gated`] and [`apply_model_provider`].
     #[cfg(test)]
     async fn wait_test_gate(&self) {
-        let (entered, release) = {
+        let (entered, release, done) = {
             let guard = self.test_gated_op_pause.lock().unwrap();
             match &*guard {
-                Some((e, r)) => (e.clone(), r.clone()),
+                Some((e, r, d)) => (e.clone(), r.clone(), d.clone()),
                 None => return,
             }
         };
         entered.notify_one();
         release.notified().await;
+        done.notify_one();
     }
 
     #[cfg(not(test))]
@@ -231,18 +237,24 @@ impl SessionStore {
 
     /// Install a test-only pause gate at the pre-commit boundary inside
     /// [`set_overrides_gated`] and [`apply_model_provider`]. Returns
-    /// `(entered, release)`:
-    /// - `entered`: wait on this to know the stale work has reached the
-    ///   gate (generation already captured, commit pending).
-    /// - `release`: signal this after replacing the session to let the
-    ///   stale work see the generation mismatch and bail out.
+    /// `(entered, release, done)`.
     #[cfg(test)]
-    pub fn set_test_gated_op_pause(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+    pub fn set_test_gated_op_pause(
+        &self,
+    ) -> (
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    ) {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        *self.test_gated_op_pause.lock().unwrap() =
-            Some((Arc::clone(&entered), Arc::clone(&release)));
-        (entered, release)
+        let done = Arc::new(tokio::sync::Notify::new());
+        *self.test_gated_op_pause.lock().unwrap() = Some((
+            Arc::clone(&entered),
+            Arc::clone(&release),
+            Arc::clone(&done),
+        ));
+        (entered, release, done)
     }
 
     #[cfg(test)]
