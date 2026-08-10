@@ -2052,7 +2052,7 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
-        // Acquire the per-session ordering boundary (#9484).
+        // Acquire the per-session ordering boundary.
         let _model_provider_update = self
             .ctx
             .sessions
@@ -2920,7 +2920,7 @@ impl RpcDispatcher {
                 continue;
             };
 
-            // Acquire the per-session ordering boundary (#9484). This lock
+            // Acquire the per-session ordering boundary. This lock
             // belongs to the session instance that was live at snapshot time.
             let Some(_model_provider_update) =
                 ctx.sessions.lock_model_provider_update(&session_id).await
