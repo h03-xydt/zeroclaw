@@ -104,6 +104,13 @@ impl RpcSession {
     }
 }
 
+#[cfg(test)]
+type GatedOpPause = (
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+);
+
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
     #[cfg(test)]
@@ -122,13 +129,7 @@ pub struct SessionStore {
     /// `release`, then signal `done` on exit, letting a regression test
     /// atomically replace the session and wait for completion.
     #[cfg(test)]
-    test_gated_op_pause: std::sync::Mutex<
-        Option<(
-            Arc<tokio::sync::Notify>, // entered
-            Arc<tokio::sync::Notify>, // release
-            Arc<tokio::sync::Notify>, // done
-        )>,
-    >,
+    test_gated_op_pause: std::sync::Mutex<Option<GatedOpPause>>,
 }
 
 impl SessionStore {
@@ -239,13 +240,7 @@ impl SessionStore {
     /// [`set_overrides_gated`] and [`apply_model_provider`]. Returns
     /// `(entered, release, done)`.
     #[cfg(test)]
-    pub fn set_test_gated_op_pause(
-        &self,
-    ) -> (
-        Arc<tokio::sync::Notify>,
-        Arc<tokio::sync::Notify>,
-        Arc<tokio::sync::Notify>,
-    ) {
+    pub fn set_test_gated_op_pause(&self) -> GatedOpPause {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let done = Arc::new(tokio::sync::Notify::new());

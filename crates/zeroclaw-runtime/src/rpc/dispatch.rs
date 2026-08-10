@@ -10138,7 +10138,7 @@ mod tests {
         // Spawn the configure handler — it will capture the generation,
         // acquire the per-session lock, build the provider, then block at
         // the gate inside set_overrides_gated.
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_spawn::spawn!(async move {
             dispatcher
                 .handle_session_configure(&json!({
                     "session_id": sid,
