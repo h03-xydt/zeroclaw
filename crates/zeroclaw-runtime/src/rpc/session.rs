@@ -217,24 +217,38 @@ impl SessionStore {
     }
 
     /// Await the test-only pause gate before validating generation in
-    /// [`set_overrides_gated`] and [`apply_model_provider`].
+    /// [`set_overrides_gated`] and [`apply_model_provider`]. Returns the
+    /// `done` notifier which must be signalled after the generation check
+    /// (and any apply attempt) completes so tests don't observe the
+    /// successor before the stale work has run its course.
     #[cfg(test)]
-    async fn wait_test_gate(&self) {
+    async fn wait_test_gate(&self) -> Option<Arc<tokio::sync::Notify>> {
         let (entered, release, done) = {
             let guard = self.test_gated_op_pause.lock().unwrap();
             match &*guard {
                 Some((e, r, d)) => (e.clone(), r.clone(), d.clone()),
-                None => return,
+                None => return None,
             }
         };
         entered.notify_one();
         release.notified().await;
-        done.notify_one();
+        Some(done)
+    }
+
+    /// Signal the `done` notifier returned by [`wait_test_gate`].
+    #[cfg(test)]
+    fn signal_test_gate_done(&self, done: Option<Arc<tokio::sync::Notify>>) {
+        if let Some(d) = done {
+            d.notify_one();
+        }
     }
 
     #[cfg(not(test))]
     #[inline(always)]
     async fn wait_test_gate(&self) {}
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn signal_test_gate_done(&self, _done: ()) {}
 
     /// Install a test-only pause gate at the pre-commit boundary inside
     /// [`set_overrides_gated`] and [`apply_model_provider`]. Returns
@@ -306,11 +320,12 @@ impl SessionStore {
         generation: u64,
         patch: SessionOverrides,
     ) -> Option<SessionOverrides> {
-        self.wait_test_gate().await;
+        let done = self.wait_test_gate().await;
         let merged = self.preview_overrides(id, &patch).await?;
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(id)?;
         if session.generation != generation {
+            self.signal_test_gate_done(done);
             return None;
         }
         session.overrides = merged.clone();
@@ -325,6 +340,7 @@ impl SessionStore {
         if overrides.temperature.is_some() {
             guard.set_temperature(overrides.temperature);
         }
+        self.signal_test_gate_done(done);
         Some(overrides)
     }
 
@@ -380,13 +396,19 @@ impl SessionStore {
         tool_dispatcher: Box<dyn ToolDispatcher>,
         temperature: Option<Option<f64>>,
     ) -> bool {
-        self.wait_test_gate().await;
+        let done = self.wait_test_gate().await;
         let agent = {
             let sessions = self.sessions.lock().await;
             match sessions.get(id) {
                 Some(s) if s.generation == generation => s.agent.clone(),
-                Some(_) => return false,
-                None => return false,
+                Some(_) => {
+                    self.signal_test_gate_done(done);
+                    return false;
+                }
+                None => {
+                    self.signal_test_gate_done(done);
+                    return false;
+                }
             }
         };
         let mut guard = agent.lock().await;
@@ -397,6 +419,7 @@ impl SessionStore {
         if let Some(t) = temperature {
             guard.set_temperature(t);
         }
+        self.signal_test_gate_done(done);
         true
     }
 

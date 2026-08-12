@@ -2909,19 +2909,15 @@ impl RpcDispatcher {
     {
         let session_ids = ctx.sessions.list_ids().await;
         for session_id in session_ids {
-            // Snapshot identity before acquiring the per-session update lock.
-            // This binds the generation to the session instance that the
-            // refresh will target. If the session is replaced under the same
-            // ID while we wait for the lock or build the provider, the
-            // re-verification after lock acquisition will detect the mismatch.
-            let Some((agent_alias, overrides, session_generation)) =
-                ctx.sessions.refresh_snapshot(&session_id).await
-            else {
+            // Capture the generation before acquiring the lock so we can
+            // detect same-ID replacement while waiting.
+            let Some(session_generation) = ctx.sessions.get_generation(&session_id).await else {
                 continue;
             };
 
-            // Acquire the per-session ordering boundary. This lock
-            // belongs to the session instance that was live at snapshot time.
+            // Acquire the per-session ordering boundary. This serialises
+            // with session/configure so the state we read afterwards
+            // reflects any configure that committed before this point.
             let Some(_model_provider_update) =
                 ctx.sessions.lock_model_provider_update(&session_id).await
             else {
@@ -2929,14 +2925,25 @@ impl RpcDispatcher {
             };
 
             // Re-verify the session has not been replaced while we waited
-            // for the lock. If the generation advanced, a successor was
-            // installed and this refresh is stale — abort.
+            // for the lock.
             let Some(current_gen) = ctx.sessions.get_generation(&session_id).await else {
                 continue;
             };
             if current_gen != session_generation {
                 continue;
             };
+
+            // Re-read alias and overrides inside the ordering boundary.
+            // A session/configure may have committed new overrides on the
+            // same generation while we were waiting for the lock; reading
+            // here ensures the refresh acts on the latest state.
+            let Some(agent_alias) = ctx.sessions.get_agent_alias(&session_id).await else {
+                continue;
+            };
+            let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
+                continue;
+            };
+
             let (model_provider, model_provider_name, model_name, tool_dispatcher, temperature) = {
                 let config = ctx.config.read();
                 let Some(model_provider_ref) =
