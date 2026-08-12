@@ -67,9 +67,9 @@ pub struct RpcSession {
     pub plan: Vec<PlanEntry>,
     pub chat_mode: crate::rpc::types::ChatMode,
     pub owner_tui_id: Option<String>,
-    /// Monotonic generation counter stamped by [`SessionStore::insert`].
+    /// Monotonic generation counter stamped by `SessionStore::insert`.
     /// Provider-refresh callers capture this before building a provider box
-    /// and pass it to [`SessionStore::apply_model_provider`] so stale work
+    /// and pass it to `SessionStore::apply_model_provider` so stale work
     /// cannot mutate a successor installed under the same session ID.
     pub generation: u64,
 }
@@ -120,12 +120,12 @@ pub struct SessionStore {
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
     max_sessions: usize,
     pub session_queue: Arc<SessionActorQueue>,
-    /// Monotonic counter incremented on every [`insert`] that installs or
+    /// Monotonic counter incremented on every `insert` that installs or
     /// replaces a session entry. Captured by provider-refresh callers so
-    /// [`apply_model_provider`] can reject work from a stale instance.
+    /// `apply_model_provider` can reject work from a stale instance.
     session_generation: std::sync::atomic::AtomicU64,
-    /// Test-only gate: when set, [`set_overrides_gated`] and
-    /// [`apply_model_provider`] signal `entered` on entry, wait on
+    /// Test-only gate: when set, `set_overrides_gated` and
+    /// `apply_model_provider` signal `entered` on entry, wait on
     /// `release`, then signal `done` on exit, letting a regression test
     /// atomically replace the session and wait for completion.
     #[cfg(test)]
@@ -210,14 +210,14 @@ impl SessionStore {
     /// Return the current generation for the session with `id`, or `None` if
     /// the session is absent. Provider-refresh callers capture this value
     /// before building a provider box and thread it through
-    /// [`apply_model_provider`] so stale work targeting a replaced session
+    /// `apply_model_provider` so stale work targeting a replaced session
     /// becomes a no-op.
     pub async fn get_generation(&self, id: &str) -> Option<u64> {
         self.sessions.lock().await.get(id).map(|s| s.generation)
     }
 
     /// Await the test-only pause gate before validating generation in
-    /// [`set_overrides_gated`] and [`apply_model_provider`]. Returns the
+    /// `set_overrides_gated` and `apply_model_provider`. Returns the
     /// `done` notifier which must be signalled after the generation check
     /// (and any apply attempt) completes so tests don't observe the
     /// successor before the stale work has run its course.
@@ -235,7 +235,7 @@ impl SessionStore {
         Some(done)
     }
 
-    /// Signal the `done` notifier returned by [`wait_test_gate`].
+    /// Signal the `done` notifier returned by `wait_test_gate`.
     #[cfg(test)]
     fn signal_test_gate_done(&self, done: Option<Arc<tokio::sync::Notify>>) {
         if let Some(d) = done {
@@ -251,7 +251,7 @@ impl SessionStore {
     fn signal_test_gate_done(&self, _done: ()) {}
 
     /// Install a test-only pause gate at the pre-commit boundary inside
-    /// [`set_overrides_gated`] and [`apply_model_provider`]. Returns
+    /// `set_overrides_gated` and `apply_model_provider`. Returns
     /// `(entered, release, done)`.
     #[cfg(test)]
     pub fn set_test_gated_op_pause(&self) -> GatedOpPause {
@@ -310,7 +310,7 @@ impl SessionStore {
         Some(overrides)
     }
 
-    /// Like [`set_overrides`], but validates `generation` before mutating the
+    /// Like `set_overrides`, but validates `generation` before mutating the
     /// session entry or its agent. Returns `None` if the session is absent
     /// *or* if it was replaced under the same ID — both cases mean the caller
     /// captured a stale generation and the work must be discarded.
@@ -385,7 +385,7 @@ impl SessionStore {
     /// set to `v` (which may be `None`, clearing a prior profile temperature).
     /// When `temperature` is `None`, the agent's temperature is left unchanged
     /// — used by `session/configure` where temperature is already committed
-    /// via [`set_overrides_gated`].
+    /// via `set_overrides_gated`.
     pub async fn apply_model_provider(
         &self,
         id: &str,
