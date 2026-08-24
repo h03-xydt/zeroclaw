@@ -11175,7 +11175,7 @@ mod tests {
             model_name, "old-model",
             "successor model must not be overwritten by stale configure"
         );
-        assert_eq!(provider_name, "openai");
+        assert_eq!(provider_name, "openai.test-provider");
         assert_eq!(
             guard.temperature_for_test(),
             Some(0.2),
@@ -11254,7 +11254,7 @@ mod tests {
             model_name, "old-model",
             "successor model must not be overwritten by stale config/set refresh"
         );
-        assert_eq!(provider_name, "openai");
+        assert_eq!(provider_name, "openai.test-provider");
         assert_eq!(
             guard.temperature_for_test(),
             Some(0.2),
@@ -11343,7 +11343,7 @@ mod tests {
             model_name, "old-model",
             "rehydrated successor model must not be overwritten by stale config/set refresh"
         );
-        assert_eq!(provider_name, "openai");
+        assert_eq!(provider_name, "openai.test-provider");
         assert_eq!(
             guard.temperature_for_test(),
             Some(0.2),
