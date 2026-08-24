@@ -271,16 +271,6 @@ impl SessionStore {
         *self.test_gated_op_pause.lock().unwrap() = None;
     }
 
-    /// Snapshot the generation, agent alias, and overrides for `id` under
-    /// one lock. Used by provider-refresh callers so a same-ID replacement
-    /// cannot produce a mixed identity snapshot (e.g. old overrides paired
-    /// with the successor's generation).
-    pub async fn refresh_snapshot(&self, id: &str) -> Option<(String, SessionOverrides, u64)> {
-        let sessions = self.sessions.lock().await;
-        let s = sessions.get(id)?;
-        Some((s.agent_alias.clone(), s.overrides.clone(), s.generation))
-    }
-
     pub async fn touch(&self, id: &str) {
         if let Some(s) = self.sessions.lock().await.get_mut(id) {
             s.last_active = Instant::now();
@@ -1474,51 +1464,6 @@ mod tests {
             guard.temperature_for_test(),
             Some(0.42),
             "temperature must be set on the captured agent under the generation check"
-        );
-    }
-
-    #[tokio::test]
-    async fn refresh_snapshot_returns_consistent_identity_under_one_lock() {
-        let store = make_store(4);
-        store
-            .insert(
-                "s".into(),
-                RpcSession::new(
-                    make_agent(),
-                    "alias-x",
-                    ".",
-                    crate::rpc::types::ChatMode::Chat,
-                ),
-            )
-            .await
-            .unwrap();
-        let (alias, overrides, captured_gen) =
-            store.refresh_snapshot("s").await.expect("session exists");
-        assert_eq!(alias, "alias-x");
-        assert_eq!(overrides.model, None);
-        assert!(captured_gen > 0);
-
-        // Replace under same ID.
-        let mut repl = RpcSession::new(
-            make_agent(),
-            "alias-y",
-            ".",
-            crate::rpc::types::ChatMode::Chat,
-        );
-        repl.overrides.model = Some("successor-override".into());
-        store.insert("s".into(), repl).await.unwrap();
-
-        let (alias2, overrides2, captured_gen2) =
-            store.refresh_snapshot("s").await.expect("session exists");
-        assert_eq!(alias2, "alias-y", "successor alias");
-        assert_eq!(
-            overrides2.model.as_deref(),
-            Some("successor-override"),
-            "successor override"
-        );
-        assert_ne!(
-            captured_gen, captured_gen2,
-            "generation must advance on replacement"
         );
     }
 }
