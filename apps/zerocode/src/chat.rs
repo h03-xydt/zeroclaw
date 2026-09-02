@@ -477,9 +477,9 @@ impl Chat {
         //
         // A fresh session also passes no cwd unless the user explicitly picked
         // one (the remote ACP CWD picker). That lets the daemon resolve the
-        // selected agent's configured workspace (issue #9534 / PR #9536)
-        // instead of forcing the TUI's launch directory — for Local and WSS
-        // alike. An explicit caller-supplied cwd still wins over that default.
+        // selected agent's configured workspace instead of forcing the TUI's
+        // launch directory — for Local and WSS alike. An explicit
+        // caller-supplied cwd still wins over that default.
         let cwd_str: Option<String> = if resume.is_some() {
             None
         } else {
@@ -588,9 +588,8 @@ impl Chat {
 
         // A restart mints a fresh session: pass no cwd so the daemon resolves
         // the selected agent's configured workspace rather than the TUI's
-        // launch directory (issue #9534 / PR #9536). The remote ACP path above
-        // re-prompts via the CWD picker, so only that explicit choice overrides
-        // the agent workspace.
+        // launch directory. The remote ACP path above re-prompts via the CWD
+        // picker, so only that explicit choice overrides the agent workspace.
         let new_session = if pane_kind == PaneKind::Acp {
             rpc.session_new_acp(&alias, None, None).await
         } else {
@@ -9729,8 +9728,8 @@ mod tests {
         let params = &request["params"];
         assert_eq!(params["agent_alias"], "alpha");
         assert!(params["session_id"].is_null());
-        // Regression guard for #10537: a fresh local session must not send the
-        // TUI's launch directory as cwd. Omitting it lets the daemon resolve the
+        // Regression guard: a fresh local session must not send the TUI's
+        // launch directory as cwd. Omitting it lets the daemon resolve the
         // selected agent's configured workspace.
         assert!(params["cwd"].is_null());
 
@@ -9796,8 +9795,8 @@ mod tests {
         let params = &request["params"];
         assert_eq!(params["agent_alias"], "alpha");
         assert!(params["session_id"].is_null());
-        // Regression guard for #10537: restart must not re-point the session at
-        // the TUI's launch directory either.
+        // Regression guard: restart must not re-point the session at the TUI's
+        // launch directory either.
         assert!(params["cwd"].is_null());
         respond_ok(
             &rpc,
